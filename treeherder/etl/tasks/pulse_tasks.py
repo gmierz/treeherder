@@ -30,6 +30,7 @@ def store_pulse_tasks(
     newrelic.agent.add_custom_parameter("exchange", exchange)
     newrelic.agent.add_custom_parameter("routing_key", routing_key)
 
+    logger.info(f"Found pulse message/job: {pulse_job}")
     try:
         # handleMessage expects messages in this format
         runs = loop.run_until_complete(
@@ -44,6 +45,7 @@ def store_pulse_tasks(
     except TaskclusterRestFailure as e:
         logger.warning(f"Failed to parse pulse message: {e}")
 
+    logger.info(f"Found runs: {runs}")
     for run in runs:
         if run:
             JobLoader().process_job(run, root_url)
