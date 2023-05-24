@@ -39,6 +39,7 @@ export const filterText = {
   hideUncertain: 'Hide uncertain results',
   showNoise: 'Show only noise',
   hideUncomparable: 'Hide uncomparable results',
+  useReplicates: 'Use replicates (try only)',
   inputPlaceholder: 'filter text e.g. linux tp5o',
 };
 

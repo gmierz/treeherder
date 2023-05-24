@@ -5,7 +5,7 @@ from collections import defaultdict
 import django_filters
 from django.conf import settings
 from django.db import transaction
-from django.db.models import CharField, Count, Q, Subquery, Value, Case, When
+from django.db.models import CharField, Count, F, Q, Subquery, Value, Case, When
 from django.db.models.functions import Concat
 from rest_framework import exceptions, filters, generics, pagination, viewsets
 from rest_framework.response import Response
@@ -22,6 +22,7 @@ from treeherder.perf.models import (
     PerformanceAlertSummary,
     PerformanceBugTemplate,
     PerformanceDatum,
+    PerformanceDatumReplicate,
     PerformanceFramework,
     PerformanceSignature,
     PerformanceTag,
@@ -624,6 +625,7 @@ class PerformanceSummary(generics.ListAPIView):
         no_subtests = query_params.validated_data['no_subtests']
         all_data = query_params.validated_data['all_data']
         no_retriggers = query_params.validated_data['no_retriggers']
+        replicates = query_params.validated_data['replicates']
 
         signature_data = PerformanceSignature.objects.select_related(
             'framework', 'repository', 'platform', 'push', 'job'
@@ -707,10 +709,20 @@ class PerformanceSummary(generics.ListAPIView):
         else:
             grouped_values = defaultdict(list)
             grouped_job_ids = defaultdict(list)
-            for signature_id, value, job_id in data.values_list('signature_id', 'value', 'job_id'):
-                if value is not None:
-                    grouped_values[signature_id].append(value)
-                    grouped_job_ids[signature_id].append(job_id)
+            if replicates:
+                for signature_id, value, job_id, replicate_value in data.values_list(
+                    'signature_id', 'value', 'job_id', 'performancedatumreplicate__value'
+                ):
+                    if replicate_value is not None:
+                        grouped_values[signature_id].append(replicate_value)
+                        grouped_job_ids[signature_id].append(job_id)
+            else:
+                for signature_id, value, job_id in data.values_list(
+                    'signature_id', 'value', 'job_id'
+                ):
+                    if value is not None:
+                        grouped_values[signature_id].append(value)
+                        grouped_job_ids[signature_id].append(job_id)
 
             # name field is created in the serializer
             for item in self.queryset:
