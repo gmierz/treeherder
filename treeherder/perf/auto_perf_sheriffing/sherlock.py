@@ -1,9 +1,8 @@
 import logging
 import os
-import requests
 import traceback
 from datetime import datetime, timedelta, timezone
-from json import loads, JSONDecodeError
+from json import JSONDecodeError, loads
 from logging import INFO, WARNING
 
 import requests
@@ -22,9 +21,9 @@ from treeherder.perf.models import (
     BackfillRecord,
     BackfillReport,
     PerformanceFramework,
-    PerformanceTelemetrySignature,
     PerformanceTelemetryAlert,
     PerformanceTelemetryAlertSummary,
+    PerformanceTelemetrySignature,
     Push,
     Repository,
 )
