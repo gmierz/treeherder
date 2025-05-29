@@ -1,6 +1,7 @@
 import logging
 import os
 import traceback
+from copy import deepcopy
 from datetime import datetime, timedelta, timezone
 from json import JSONDecodeError, loads
 from logging import INFO, WARNING
@@ -15,6 +16,16 @@ from treeherder.perf.auto_perf_sheriffing.backfill_reports import (
 )
 from treeherder.perf.auto_perf_sheriffing.backfill_tool import BackfillTool
 from treeherder.perf.auto_perf_sheriffing.secretary import Secretary
+from treeherder.perf.auto_perf_sheriffing.telemetry_alerting.alert import (
+    TelemetryAlertFactory,
+)
+from treeherder.perf.auto_perf_sheriffing.telemetry_alerting.alert_manager import (
+    TelemetryAlertManager,
+)
+from treeherder.perf.auto_perf_sheriffing.telemetry_alerting.probe import (
+    TelemetryProbe,
+    TelemetryProbeValidationError,
+)
 from treeherder.perf.exceptions import CannotBackfillError, MaxRuntimeExceededError
 from treeherder.perf.models import (
     BackfillNotificationRecord,
@@ -34,20 +45,20 @@ CLIENT_ID = settings.PERF_SHERIFF_BOT_CLIENT_ID
 ACCESS_TOKEN = settings.PERF_SHERIFF_BOT_ACCESS_TOKEN
 
 BUILDID_MAPPING = "https://hg.mozilla.org/mozilla-central/json-firefoxreleases"
-REVISION_INFO = "https://hg.mozilla.org/mozilla-central/json-log/%s"
+
 
 INITIAL_PROBES = (
-    "memory_ghost_windows",
-    "cycle_collector_time",
-    "mouseup_followed_by_click_present_latency",
-    "network_tcp_connection",
-    "network_tls_handshake",
+    # "memory_ghost_windows",
+    # "cycle_collector_time",
+    # "mouseup_followed_by_click_present_latency",
+    # "network_tcp_connection",
+    # "network_tls_handshake",
     "networking_http_channel_page_open_to_first_sent",
-    "performance_pageload_fcp",
-    "perf_largest_contentful_paint",
-    "performance_interaction_keypress_present_latency",
-    "gfx_content_full_paint_time",
-    "paint_build_displaylist_time",
+    # "performance_pageload_fcp",
+    # "perf_largest_contentful_paint",
+    # "performance_interaction_keypress_present_latency",
+    # "gfx_content_full_paint_time",
+    # "paint_build_displaylist_time",
 )
 
 
@@ -268,17 +279,27 @@ class Sherlock:
 
         metric_definitions = self._get_metric_definitions()
 
+        probes = {}
+        alerts = []
         repository = Repository.objects.get(name="mozilla-central")
         framework = PerformanceFramework.objects.get(name="telemetry")
         for metric_info in metric_definitions:
             if metric_info["name"] not in INITIAL_PROBES:
                 continue
-            logger.info(f"Running detection for {metric_info['name']}")
-            cdf_ts_detector = ts_detectors[
-                metric_info["data"]
-                .get("monitor", {})
-                .get("change-detection-technique", "cdf_squared")
-            ]
+            try:
+                probe = TelemetryProbe(metric_info)
+            except TelemetryProbeValidationError as e:
+                logger.warning(f"Failed probe validation: {str(e)}")
+                continue
+
+            if not probe.should_detect_changes():
+                continue
+            print(metric_info)
+            return
+            probes.setdefault(probe.name, probe)
+
+            logger.info(f"Running detection for {probe.name}")
+            cdf_ts_detector = ts_detectors[probe.get_change_detection_technique()]
 
             for platform in ("Windows", "Darwin", "Linux"):
                 if metric_info["platform"] == "mobile" and platform != "Mobile":
@@ -288,7 +309,7 @@ class Sherlock:
                 logger.info(f"On Platform {platform}")
                 try:
                     data = get_metric_table(
-                        metric_info["name"],
+                        probe.name,
                         platform,
                         android=(platform == "Mobile"),
                         use_fog=True,
@@ -307,11 +328,17 @@ class Sherlock:
                         # Only get buildids if there might be a detection
                         if not self._buildid_mappings:
                             self._make_buildid_to_date_mapping()
-                        self._create_detection_alert(
-                            detection, metric_info, platform, repository, framework
+                        alert = self._create_detection_alert(
+                            detection, probe, platform, repository, framework
                         )
+                        if alert:
+                            alerts.append(alert)
                 except Exception:
                     logger.info(f"Failed: {traceback.format_exc()}")
+
+        if alerts:
+            alert_manager = TelemetryAlertManager(probes)
+            alert_manager.manage_alerts(alerts)
 
     def _is_prod(self):
         return settings.SITE_HOSTNAME == "treeherder.mozilla.org"
@@ -322,7 +349,7 @@ class Sherlock:
     def _create_detection_alert(
         self,
         detection: object,
-        probe_info: dict,
+        probe: TelemetryProbe,
         platform: str,
         repository: Repository,
         framework: PerformanceFramework,
@@ -332,7 +359,7 @@ class Sherlock:
         probe_signature, _ = PerformanceTelemetrySignature.objects.update_or_create(
             channel="Nightly",
             platform=platform,
-            probe=probe_info["name"],
+            probe=probe.name,
             probe_type="Glean",
             application="Firefox",
         )
@@ -360,8 +387,8 @@ class Sherlock:
             detection_summary = PerformanceTelemetryAlertSummary.objects.filter(
                 repository=repository,
                 framework=framework,
-                push__time__gte=oldest_timestamp,
-                push__time__lte=latest_timestamp,
+                push__time__gte=latest_timestamp,
+                push__time__lte=oldest_timestamp,
             ).latest("push__time")
         except PerformanceTelemetryAlertSummary.DoesNotExist:
             detection_summary = None
@@ -375,36 +402,51 @@ class Sherlock:
                 prev_push=prev_push,
                 push=next_push,
                 original_push=detection_push,
+                sheriffed=False,
                 defaults={
                     "manually_created": False,
                     "created": datetime.now(timezone.utc),
                 },
             )
 
-        detection_alert, _ = PerformanceTelemetryAlert.objects.update_or_create(
-            summary_id=detection_summary.id,
-            series_signature=probe_signature,
-            defaults={
-                "is_regression": True,
-                "amount_pct": round(
-                    (100.0 * abs(detection.new_value - detection.previous_value))
-                    / float(detection.previous_value),
-                    2,
-                ),
-                "amount_abs": abs(detection.new_value - detection.previous_value),
-                "sustained": True,
-                "direction": detection.direction,
-                "confidence": detection.confidence,
-                "prev_value": detection.previous_value,
-                "new_value": detection.new_value,
-                "prev_median": detection.optional_detection_info["Interpolated Median"][0],
-                "new_median": detection.optional_detection_info["Interpolated Median"][1],
-                "prev_p90": detection.optional_detection_info["Interpolated p05"][0],
-                "new_p90": detection.optional_detection_info["Interpolated p05"][1],
-                "prev_p95": detection.optional_detection_info["Interpolated p95"][0],
-                "new_p95": detection.optional_detection_info["Interpolated p95"][1],
-            },
-        )
+        try:
+            detection_alert = PerformanceTelemetryAlert.objects.get(
+                summary_id=detection_summary.id, series_signature_id=probe_signature.id
+            )
+        except PerformanceTelemetryAlert.DoesNotExist:
+            detection_alert = None
+
+        if not detection_alert:
+            detection_alert, _ = PerformanceTelemetryAlert.objects.update_or_create(
+                summary_id=detection_summary.id,
+                series_signature=probe_signature,
+                defaults={
+                    "is_regression": True,
+                    "amount_pct": round(
+                        (100.0 * abs(detection.new_value - detection.previous_value))
+                        / float(detection.previous_value),
+                        2,
+                    ),
+                    "amount_abs": abs(detection.new_value - detection.previous_value),
+                    "sustained": True,
+                    "direction": detection.direction,
+                    "confidence": detection.confidence,
+                    "prev_value": detection.previous_value,
+                    "new_value": detection.new_value,
+                    "prev_median": detection.optional_detection_info["Interpolated Median"][0],
+                    "new_median": detection.optional_detection_info["Interpolated Median"][1],
+                    "prev_p90": detection.optional_detection_info["Interpolated p05"][0],
+                    "new_p90": detection.optional_detection_info["Interpolated p05"][1],
+                    "prev_p95": detection.optional_detection_info["Interpolated p95"][0],
+                    "new_p95": detection.optional_detection_info["Interpolated p95"][1],
+                },
+            )
+
+            return TelemetryAlertFactory.construct_alert(
+                telemetry_alert=detection_alert,
+                telemetry_alert_summary=detection_summary,
+                telemetry_signature=probe_signature,
+            )
 
     def _get_metric_definitions(self) -> list[dict]:
         metric_definition_urls = [
