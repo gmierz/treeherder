@@ -717,6 +717,36 @@ class PerformanceTelemetryAlert(PerformanceAlertBase):
     prev_p95 = models.FloatField(help_text="Previous P95 value of series before change")
     new_p95 = models.FloatField(help_text="New P95 value of series after change")
 
+    # Each alerting probe will get 1 bug, but we still want to group
+    # them together so the bug number field is added to the telemetry alerts as well
+    NEW = 0
+    FIXED = 1
+    INVALID = 2
+    WONTFIX = 5
+    INACTIVE = 3
+    DUPLICATE = 4
+    WORKSFORME = 6
+    INCOMPLETE = 7
+    MOVED = 8
+
+    STATUSES = (
+        (NEW, "NEW"),
+        (FIXED, "FIXED"),
+        (INVALID, "INVALID"),
+        (WONTFIX, "WONTFIX"),
+        (INACTIVE, "INACTIVE"),
+        (DUPLICATE, "DUPLICATE"),
+        (WORKSFORME, "WORKSFORME"),
+        (INCOMPLETE, "INCOMPLETE"),
+        (MOVED, "MOVED"),
+    )
+
+    status = models.IntegerField(choices=STATUSES, default=NEW)
+    bug_number = models.PositiveIntegerField(null=True)
+
+    # This field tells us if the appropriate owners were already notified
+    notified = models.BooleanField(default=False)
+
     class Meta:
         db_table = "performance_telemetry_alert"
         unique_together = ("summary", "series_signature")

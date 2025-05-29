@@ -27,6 +27,7 @@ from treeherder.perf.models import (
     Push,
     Repository,
 )
+from treeherder.services import taskcluster
 
 logger = logging.getLogger(__name__)
 
@@ -35,6 +36,28 @@ ACCESS_TOKEN = settings.PERF_SHERIFF_BOT_ACCESS_TOKEN
 
 BUILDID_MAPPING = "https://hg.mozilla.org/mozilla-central/json-firefoxreleases"
 REVISION_INFO = "https://hg.mozilla.org/mozilla-central/json-log/%s"
+GLEAN_DICTIONARY = "https://dictionary.telemetry.mozilla.org/apps/{page}/metrics/{probe}"
+TREEHERDER_PUSH = "https://treeherder.mozilla.org/jobs?repo={repo}&revision={revision}"
+TREEHERDER_DATES = (
+    "https://treeherder.mozilla.org/jobs?repo={repo}&"
+    "fromchange={from_change}&tochange={to_change}"
+)
+PUSH_LOG = (
+    "https://hg-edge.mozilla.org/mozilla-central/pushloghtml?"
+    "startdate={start_date}&enddate={end_date}"
+)
+BZ_TELEMETRY_ALERTS = (
+    "https://bugzilla.mozilla.org/buglist.cgi?"
+    "keywords=telemetry-alert&keywords_type=allwords"
+    "&chfield=[Bug%20creation]&chfieldto={today}&chfieldfrom={prev_day}&"
+)
+
+DESKTOP_PLATFORMS = ("Windows", "Linux", "Darwin",)
+CHANNEL_TO_REPO_MAPPING = {
+    "Nightly": "mozilla-central",
+    "Release": "mozilla-release",
+    "Beta": "mozilla-beta",
+}
 
 INITIAL_PROBES = (
     "memory_ghost_windows",
@@ -295,13 +318,26 @@ class Sherlock:
                     ts_detector = cdf_ts_detector(timeseries)
                     detections = ts_detector.detect_changes()
 
+                    alerts = []
                     for detection in detections:
                         # Only get buildids if there might be a detection
                         if not self._buildid_mappings:
                             self._make_buildid_to_date_mapping()
-                        self._create_detection_alert(
+                        alert = self._create_detection_alert(
                             detection, metric_info, platform, repository, framework
                         )
+                        if alert:
+                            alerts.append(alert)
+                        break
+
+                    if alerts:
+                        alert_manager = TelemetryAlertManager(
+                            metric_definitions, TelemetryBugManager(), TelemetryEmailManager()
+                        )
+                        alert_manager.manage_alerts(
+                            alerts
+                        )
+
                 except Exception:
                     logger.info(f"Failed: {traceback.format_exc()}")
 
@@ -367,6 +403,16 @@ class Sherlock:
                 },
             )
 
+        try:
+            detection_alert = PerformanceTelemetryAlert.objects.get(
+                summary_id=detection_summary.id,
+                series_signature_id=probe_signature.id
+            )
+        except PerformanceTelemetryAlertSummary.DoesNotExist:
+            detection_alert = None
+
+
+        # if not detection_alert:
         detection_alert, _ = PerformanceTelemetryAlert.objects.update_or_create(
             summary_id=detection_summary.id,
             series_signature=probe_signature,
@@ -391,6 +437,9 @@ class Sherlock:
                 "new_p95": detection.optional_detection_info["Interpolated p95"][1],
             },
         )
+        return TelemetryAlert(probe_signature, detection_alert, detection_summary)
+
+        # return None
 
     def _get_metric_definitions(self) -> list[dict]:
         metric_definition_urls = [
@@ -477,3 +526,840 @@ class Sherlock:
             prev_date = date
 
         return prev_date
+
+
+from treeherder.perf.email import Email, EmailWriter
+
+
+###############
+#### utils ####
+###############
+
+
+def get_glean_dictionary_link(telemetry_signature):
+    if telemetry_signature.platform in DESKTOP_PLATFORMS:
+        dictionary_page = "firefox_desktop"
+    else:
+        dictionary_page = "fenix"
+    return GLEAN_DICTIONARY.format(
+        page=dictionary_page,
+        probe=telemetry_signature.probe
+    )
+
+
+def get_treeherder_detection_link(detection_range, telemetry_signature):
+    repo = CHANNEL_TO_REPO_MAPPING.get(
+        telemetry_signature.channel, "mozilla-central"
+    )
+
+    return TREEHERDER_PUSH.format(
+        repo=repo,
+        revision=detection_range["detection"].revision
+    )
+
+
+def get_treeherder_detection_range_link(detection_range, telemetry_signature):
+    repo = CHANNEL_TO_REPO_MAPPING.get(
+        telemetry_signature.channel, "mozilla-central"
+    )
+
+    return TREEHERDER_DATES.format(
+        repo=repo,
+        from_change=detection_range["from"].revision,
+        to_change=detection_range["to"].revision
+    )
+
+
+def get_notification_emails(metric_info, default="gmierzwinski@mozilla.com"):
+    return metric_info["data"].get("monitor", {}).get(
+        "bugzilla_notification_emails",
+        metric_info.get("notification_emails", [default])
+    )
+
+
+
+#########################################
+#### telemetry probe representation #####
+#########################################
+
+
+class TelemetryProbe:
+    def __init__(self, metric_info):
+        self.metric_info = metric_info
+        self.verify_probe_definition(metric_info)
+
+    def verify_probe_definition(self):
+        pass
+
+    def should_file_bug(self):
+        pass
+
+    def should_email(self):
+        pass
+
+    def get_notification_emails(metric_info, default="gmierzwinski@mozilla.com"):
+        return metric_info["data"].get("monitor", {}).get(
+            "bugzilla_notification_emails",
+            metric_info.get("notification_emails", [default])
+        )
+
+#######################
+#### alert manager ####
+#######################
+
+
+class TelemetryAlert:
+    def __init__(self, telemetry_signature, telemetry_alert, telemetry_alert_summary):
+        self.telemetry_signature = telemetry_signature
+        self.telemetry_alert = telemetry_alert
+        self.telemetry_alert_summary = telemetry_alert_summary
+        self.related_telemetry_alerts = None
+        self.detection_range = None
+
+    def get_related_alerts(self):
+        if self.related_telemetry_alerts:
+            return self.related_telemetry_alerts
+
+        self.related_telemetry_alerts = PerformanceTelemetryAlert.objects.filter(
+            summary_id=self.telemetry_alert_summary.id
+        ).exclude(
+            id=self.telemetry_alert.id
+        )
+
+        return self.related_telemetry_alerts
+
+    def get_detection_range(self):
+        if self.detection_range:
+            return self.detection_range
+
+        self.detection_range = {
+            "from": self.telemetry_alert_summary.prev_push,
+            "to": self.telemetry_alert_summary.push,
+            "detection": self.telemetry_alert_summary.original_push,
+        }
+
+        return self.detection_range
+
+class AlertManager:
+    """Handles the alert management.
+
+    This includes the following:
+        (1) Filing bugs
+        (2) Setting status for the alerts when bugs are updated
+        (3) Adding comments to bugs for addition alerts when they are produced
+            after the bug was.
+    """
+    def __init__(self, bug_manager, email_manager):
+        self.bug_manager = bug_manager
+        self.email_manager = email_manager
+
+    def manage_alerts(self, alerts, *args, **kwargs):
+        """Handles everything related to alert notifications.
+
+        None of these depend on each other, so a failure in one doesn't always
+        mean that a failure in another one will happen. 
+        """
+        # if not settings.TELEMETRY_ENABLE_ALERTS_MANAGER:
+        #     logger.info(
+        #         "Telemetry alerts manager is not enabled. Set "
+        #         "TELEMETRY_ENABLE_ALERTS_MANAGER=1 to enable it."
+        #     )
+        #     return
+
+        try:
+            # Update alerts with bug info. Done before filing new bugs
+            # to prevent updating from recently filed bugs
+            self.update_alerts(*args, **kwargs)
+        except Exception:
+            logger.info(f"Failed to update alerts: {traceback.format_exc()}")
+
+        try:
+            # Comment on existing bugs. Done before filing new bugs to
+            # prevent commenting on recently filed bugs
+            commented_bugs = self.comment_alert_bugs(*args, **kwargs)
+        except Exception:
+            logger.info(f"Failed to comment on existing bugs: {traceback.format_exc()}")
+        
+        try:
+            # File new bugs
+            new_bugs = self.file_alert_bugs(alerts, *args, **kwargs)
+            return
+        except Exception:
+            logger.info(f"Failed to file alert bugs: {traceback.format_exc()}")
+
+        try:
+            # Modify any of the bugs that were commented on, or created
+            self.modify_alert_bugs(alerts, commented_bugs, new_bugs, *args, **kwargs)
+            return
+        except Exception:
+            logger.info(f"Failed to file alert bugs: {traceback.format_exc()}")
+
+        try:
+            # Produce email notifications. Done after filing bugs to include
+            # bug information if that becomes a feature at some point
+            self.email_alerts(alerts, *args, **kwargs)
+        except Exception:
+            logger.info(f"Failed to send email alerts: {traceback.format_exc()}")
+
+    def get_bugzilla_bugs(self, *args, **kwargs):
+        """Query to get all the bugzilla bugs for alerts."""
+        raise NotImplementedError()
+
+    def update_alerts(self, alerts, *args, **kwargs):
+        """Updates all alerts with status changes from the associated bugs."""
+        raise NotImplementedError()
+
+    def comment_alert_bugs(self, alerts, *args, **kwargs):
+        """Comments on bugs to mention additional alerting measurements."""
+        raise NotImplementedError()
+
+    def file_alert_bugs(self, alerts, *args, **kwargs):
+        """Files a bug for each telemetry alert summary."""
+        bugs = []
+
+        for alert in alerts:
+            bug = self._file_alert_bug(alert, *args, **kwargs)
+            if bug is None:
+                continue
+            bugs.append(bug)
+
+        return bugs
+
+    def _file_alert_bug(self, *args, **kwargs):
+        """Create a bug for an alert."""
+        raise NotImplementedError()
+
+    def modify_alert_bugs(self, alerts, commented_bugs, new_bugs, *args, **kwargs):
+        """Modify alert bugs."""
+        raise NotImplementedError()
+
+    def email_alerts(self, alerts, *args, **kwargs):
+        """Sends out emails for each new alert."""
+        for alert in alerts:
+            self._email_alert(alert, *args, **kwargs)
+
+    def _email_alert(self, *args, **kwargs):
+        """Produces an email for a new telemetry alert summary."""
+        raise NotImplementedError()
+
+
+@BugModifier.add
+class SeeAlsoModifier:
+    @staticmethod
+    def modify(alerts, commented_bugs, new_bugs, **kwargs):
+        pass
+
+
+class BugModifier:
+    modifiers = []
+
+    @staticmethod
+    def add(modifier_class):
+        BugModifier.modifiers.append(modifier_class)
+
+    @staticmethod
+    def get_modifiers():
+        return BugModifier.modifiers
+
+    @staticmethod
+    def get_bug_modifications(alerts, commented_bugs, new_bugs, **kwargs):
+        all_changes = {}
+        for modifier in BugModifier.get_modifiers():
+            changes = modifier.modify(alerts, commented_bugs, new_bugs, **kwargs)
+            if not changes:
+                continue
+            for bug, changes in changes.items():
+                all_changes.setdefault(bug, []).append(changes)
+        return BugModifier._merge_changes(all_changes)
+
+    @staticmethod
+    def _merge_changes(all_changes):
+
+        def __merge_change(field, value, existing_value):
+            if field in ("priority", "severity"):
+                if value != existing_value:
+                    raise Exception(
+                        f"Modification in `{field}` from multiple Modifiers is not"
+                        f"allowed. Values found: {value}, and {existing_value}"
+                    )
+                return existing_value
+            elif field in ("comment",):
+                raise Exception("Cannot post multiple comments to a bug.")
+            elif field in ("see_also", "keywords", "whiteboard",):
+                return f"{existing_value},{value}"
+            raise Exception(
+                f"Unable to consolidate field `{field}` with multiple values."
+            )
+
+        bug_changes = {}
+
+        for bug, changes in all_changes:
+            for field, value in changes.items():
+                if field not in bug_changes:
+                    bug_changes[field] = value
+                    continue
+                bug_changes[field] = __merge_change(field, value, bug_changes[field])
+
+        return bug_changes
+
+
+class TelemetryAlertManager(AlertManager):
+    """Alert Management for Telemetry Alerts.
+
+    TODOs:
+        * Update alerts with bug status changes.
+        * Add code to comment, or post changes to existing bugs
+    """
+
+    def __init__(self, metrics_info, bug_manager, email_manager):
+        super().__init__(bug_manager, email_manager)
+
+        # Convert it to a dictionary for quicker access
+        self.metrics_info = {}
+        for metric in metrics_info:
+            if metric["name"] in self.metrics_info:
+                # This happens when a metric is defined for desktop, and mobile
+                continue
+            self.metrics_info[metric["name"]] = metric
+
+    def _get_metric_info(self, probe):
+        metric_info = self.metrics_info.get(probe, None)
+        if not metric_info:
+            raise Exception(
+                f"Unknown probe alerted. No information known about it: "
+                f"{alert.telemetry_alert.telemetry_signature.probe}"
+            )
+        return metric_info
+
+    def comment_alert_bugs(self, alerts):
+        """Comments on bugs to mention additional alerting probes.
+
+        Telemetry alerting doesn't currently have any commenting behaviour.
+        Associations between related alerts will be done through the modify_alerts
+        method, and the "See Also" Bugzilla field.
+        """
+        pass
+
+    def update_alerts(self, alerts):
+        """Updates all alerts with status changes from the associated bugs.
+
+        Queries bugzilla for all telemetry-alert bugs, then goes through the
+        PerformanceTelemetryAlertSummary objects to update those that changed.
+
+        An alternative is to go through every telemetry alert in the DB, however
+        that results in many more network requests. However, this approach involves
+        more DB queries. 
+        """
+        pass
+
+    def modify_alert_bugs(self, alerts, commented_bugs, new_bugs):
+        """Modifies the alert bugs.
+
+        Modifies existing telemetry alert bugs with new bugs that alerted on
+        the same day. It adds these bugs to the "See Also" field for the other bugs.
+        """
+
+
+    def __should_file_bug(self, metric_info, alert):
+        """Ensure that the alert should have a bug filed.
+
+        Current criteria for bug filling are:
+            (1) Monitor field must be defined (already checked by this point).
+            (2) Monitor field is set to an object, AND the alert field is 
+                set to True.
+            (3) Alert does not already have a bug filed for it.
+        """
+        monitor = metric_info["data"].get("monitor". {})
+        if monitor and not alert.telemetry_alert.bug_number:
+            # Monitor field is defined, and no bug was created
+            if isinstance(monitor, bool):
+                # Monitor field is set to True, should only produce emails
+                return False
+            if isinstance(monitor, dict) and monitor.get("alert", False):
+                # Alert field is set to True
+                return True
+        return False
+
+
+    def _file_alert_bug(self, alert):
+        """Files a bug for each telemetry alert summary.
+
+        Only produced for telemetry alert summaries without a bug number. Those
+        with a bug number are handled by comment_alert_bugs.
+        """
+        metric_info = self._get_metric_info(alert.telemetry_signature.probe)
+        if not __should_file_bug(metric_info, alert):
+            return
+
+        # File a bug
+        bug_info = self.bug_manager.file_bug(metric_info, alert)
+
+        # Associate it with the alert
+        alert.telemetry_alert.bug_number = int(bug_info["id"])
+        alert.telemetry_alert.save()
+
+        return bug_info["id"]
+
+
+    def __should_notify(self, metric_info, alert):
+        """Ensure that the alert should produce notifications.
+
+        Current criteria for notifications are:
+            (1) Monitor field must be defined (already checked by this point).
+            (2) Monitor field is set to True OR monitor field is set to 
+                an object with alert set to False.
+            (3) Bug has not been filed for the alert.
+        """
+        monitor = metric_info["data"].get("monitor". {})
+        if monitor and not alert.telemetry_alert.bug_number:
+            # Monitor field is defined, and no bug was created
+            if isinstance(monitor, bool):
+                # Monitor field is set to True
+                return True
+            if isinstance(monitor, dict) and not monitor.get("alert", False):
+                # Alert field is set to False
+                return True
+        return False
+
+
+    def _email_alert(self, alert):
+        """Sends out emails for each new alert.
+
+        Each probe that alerted will have an email sent out to all alert notification
+        emails. This means that if a telemetry alert summary (a grouping of alerts)
+        contains multiple probes that alert, each of those probes will have an email
+        sent out.
+        """
+        metric_info = self._get_metric_info(alert.telemetry_signature.probe)
+        if not __should_notify(metric_info, alert):
+            return
+
+        # Send notification emails for the alert
+        self.email_manager.email_alert(metric_info, alert)
+
+        # Set the alert to notified
+        alert.telemetry_alert.notified = True
+        alert.telemetry_alert.save()
+
+
+##########################
+"""Bug management below"""
+##########################
+
+
+class BugManager:
+    """Files bugs, and comments on them for alerts."""
+
+    def __init__(self):
+        self.bz_url = settings.BUGFILER_API_URL + "/rest/bug"
+        self.bz_headers = {"Accept": "application/json"}
+
+    def _get_default_bug_creation_data(self):
+        return {
+            "summary": "",
+            "type": "defect",
+            "product": "",
+            "component": "",
+            "keywords": "",
+            "whiteboard": None,
+            "regressed_by": None,
+            "see_also": None,
+            "version": None,
+            "severity": "",
+            "priority": "",
+            "description": "",
+        }
+
+    def _get_default_bug_comment_data(self):
+        return {
+            "comment": {"body": ""}
+        }
+
+    def _add_needinfo(self, bugzilla_email, bug_data):
+        bug_data.setdefault("flags", []).append({
+            "name": "needinfo",
+            "status": "?",
+            "requestee": bugzilla_email,
+        })
+
+    def _create(self, bug_data):
+        """Create a new bug.
+
+        See `_get_default_bug_creation_data` for an example of what the
+        `bug_data` should be.
+        """
+        headers = self.bz_headers
+        headers["x-bugzilla-api-key"] = settings.BUGFILER_API_KEY
+
+        resp = requests.post(
+            url=self.bz_url,
+            json=bug_data,
+            headers=headers,
+            verify=True,
+            timeout=30,
+        )
+        resp.raise_for_status()
+
+        return resp.json()
+
+    def _modify(self, bug, changes):
+        """Add a comment, or modify a bug.
+
+        See `_get_default_bug_comment_data` for what the `bug_data`
+        should be.
+        """
+        modification_url = self.bz_url + f"/{bug}"
+        headers = self.bz_headers
+        headers["x-bugzilla-api-key"] = settings.COMMENTER_API_KEY
+        headers["User-Agent"] = f"treeherder/{settings.SITE_HOSTNAME}",
+
+        resp = requests.put(
+            url=self.bz_url,
+            json=changes,
+            headers=headers,
+            verify=True,
+            timeout=30,
+        )
+        resp.raise_for_status()
+
+        return resp.json()
+
+    def file_bug(self, *args, **kwargs):
+        raise NotImplementedError()
+
+    def modify_bug(self, *args, **kwargs):
+        raise NotImplementedError()
+
+    def comment_bug(self, *args, **kwargs):
+        raise NotImplementedError()
+
+
+class TelemetryBugManager(BugManager):
+    """Files bugs, and comments on them for telemetry alerts."""
+
+    def __init__(self):
+        super().__init__()
+
+    def file_bug(self, metric_info, alert):
+        logger.info(f"Filing bug for alert on probe {metric_info['name']}")
+        bug_data = self._get_default_bug_creation_data()
+        bug_content = TelemetryBugContent().build_bug_content(alert)
+
+        bug_data["summary"] = bug_content["title"]
+        bug_data["description"] = bug_content["description"]
+
+        # For testing use Testing :: Performance, later switch to
+        # using tags from metrics_info
+        bug_data["product"] = "Testing"
+        bug_data["component"] = "Performance"
+
+        bug_data["severity"] = "S4"
+        bug_data["priority"] = "P5"
+        bug_data["keywords"] = "telemetry-alert,regression"
+
+        # Only set a needinfo on the first email in the notification list
+        needinfo_emails = get_notification_emails(
+            metric_info, default="gmierz2@outlook.com"
+        )
+        if not needinfo_emails:
+            raise Exception(
+                f"Unable to file bug for {alert.telemetry_signature.probe} since "
+                f"there are no emails specified for needinfos."
+            )
+        self._add_needinfo(needinfo_emails[0], bug_data)
+
+        bug_info = self._create(bug_data)
+        logger.info(f"Filed bug {bug_info['id']}")
+
+        return bug_info
+
+    def modify_bug(self, bug, changes):
+        pass
+
+    def comment_bug(self, alert):
+        pass
+
+
+class TelemetryBugContent:
+    """Formats the content of a bug.
+
+    Used for producing the first comment of a bug (description, or comment #0),
+    and for producing comments after an initial bug is created.
+    """
+
+    BUG_DESCRIPTION = (
+        "MozDetect has detected changes in the following telemetry probes on "
+        "builds from [{date}]({detection_push_link}). As the probe owner of the "
+        "following probes, we need your help to address this regression and "
+        "find a culprit."
+        "\n\n{change_table}\n"
+        "[See these Treeherder pushes for possible culprits for this detected change]"
+        "({detection_range_link}).\n\n"
+        "[A push log can be found here for a quicker overview of the changes that"
+        "occurred around this change]({push_log_link}).\n\n"
+        "For more information on how to handle these probe changes, and "
+        "what the various columns mean [see here](link to docs).\n\n"
+        "Note that it’s possible the culprit is from a commit in the day before, "
+        "or the day after these push logs. It’s also possible that these culprits "
+        "are not the cause, and the change could be coming from a popular "
+        "website. Please reach out to the Performance team if you suspect this to be "
+        "the case in [#perf on Matrix](https://matrix.to/#/#perf:mozilla.org), or "
+        "[#perf-help on Slack](https://mozilla.enterprise.slack.com/archives/C03U19JCSFQ)."
+        "\n\n"
+        "[See this bugzilla query for other telemetry alerts that were "
+        "produced on this date]({bz_telemetry_alerts})."
+    )
+
+    BUG_COMMENT = (
+        "MozDetect has detected changes in additional probes on the same date "
+        "which may be related to the changes the bug was originally filed for."
+        "\n\n{change_table}"
+    )
+
+    TABLE_HEADERS = (
+        "| **Probe** | **Platform** | **Magnitude** "
+        "| **Previous Values** | **New Values** |\n"
+        "| :---: | :---: | :---: | :---: | :---: |\n"
+    )
+
+    REGRESSION_TITLE = "### Regressions\n"
+    IMPROVMENT_TITLE = "### Improvement\n"
+    GENERIC_TITLE = "### Changes Detected\n"
+
+    BUG_TITLE = "Telemetry Alert for {probe} on {date}"
+
+    def build_bug_content(self, alert):
+        bug_content = {"title": "", "description": ""}
+
+        detection_range = alert.get_detection_range()
+        detection_date = detection_range["detection"].time.strftime("%Y-%m-%d")
+        repo = CHANNEL_TO_REPO_MAPPING.get(
+            alert.telemetry_signature.channel,
+            "mozilla-central"
+        )
+
+        # End date is exclusive so we need to add 1 day to it
+        start_date = detection_range["from"].time.strftime("%Y-%m-%d")
+        end_date = (detection_range["to"].time + timedelta(days=1)).strftime("%Y-%m-%d")
+
+        bug_content["title"] = self.BUG_TITLE.format(
+            probe=alert.telemetry_signature.probe,
+            date=detection_date
+        )
+
+        bug_content["description"] = self.BUG_DESCRIPTION.format(
+            date=detection_date,
+            detection_push_link=TREEHERDER_PUSH.format(
+                repo=repo,
+                revision=detection_range["detection"].revision
+            ),
+            change_table=self._build_change_table(alert),
+            detection_range_link=TREEHERDER_DATES.format(
+                repo=repo,
+                from_change=detection_range["from"].revision,
+                to_change=detection_range["to"].revision
+            ),
+            push_log_link=PUSH_LOG.format(
+                start_date=start_date,
+                end_date=end_date
+            ),
+            bz_telemetry_alerts=BZ_TELEMETRY_ALERTS.format(
+                today=datetime.now().strftime("%Y-%m-%d"),
+                prev_day=(datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
+            )
+        )
+
+        return bug_content
+
+    def build_comment_content(self, alert):
+        comment_content = {"comment": ""}
+        pass
+
+    def _build_change_table(self, alert):
+        change_table = self.GENERIC_TITLE
+
+        if alert.telemetry_alert.is_regression:
+            change_table = self.REGRESSION_TITLE
+
+        change_table += self.TABLE_HEADERS+self._build_probe_alert_row(alert)
+
+        return change_table
+
+    def _build_probe_alert_row(self, alert):
+        values = (
+            "| **Median:** {prev_median} | **Median:** {new_median} |\n"
+            "| | | | **P90:** {prev_p90} | **P90:** {new_p90} |\n"
+            "| | | | **P95:** {prev_p95} | **P95:** {new_p95} |"
+        ).format(
+            prev_median=round(alert.telemetry_alert.prev_median, 2),
+            prev_p90=round(alert.telemetry_alert.prev_p90, 2),
+            prev_p95=round(alert.telemetry_alert.prev_p95, 2),
+            new_median=round(alert.telemetry_alert.new_median, 2),
+            new_p90=round(alert.telemetry_alert.new_p90, 2),
+            new_p95=round(alert.telemetry_alert.new_p95, 2)
+        )
+
+        return (
+            "| [{probe}]({glean_dictionary_link}) | {platform} | {magnitude} {values} \n"
+        ).format(
+            probe=alert.telemetry_signature.probe,
+            platform=alert.telemetry_signature.platform,
+            magnitude=alert.telemetry_alert.confidence,
+            values=values,
+            glean_dictionary_link=get_glean_dictionary_link(
+                alert.telemetry_signature
+            )
+        )
+
+
+
+############################
+"""Email management below"""
+############################
+
+
+
+class EmailManager:
+    """Formats and emails alert notifications."""
+
+    def __init__(self):
+        self.notify_client = taskcluster.notify_client_factory()
+
+    def get_email_func(self):
+        return self.notify_client.email
+
+    def email_alert(self, *args, **kwargs):
+        pass
+
+
+class TelemetryEmailManager(EmailManager):
+    """Formats and emails alert notifications."""
+
+    def email_alert(self, metric_info, alert):
+        telemetry_email = TelemetryEmail(self.get_email_func())
+
+        for email in get_notification_emails(metric_info):
+            telemetry_email.email(email, metric_info, alert)
+
+
+class TelemetryEmail:
+    """Adapter for the email producers."""
+
+    def __init__(self, email_func):
+        self.email_writer = TelemetryEmailWriter()
+        self.email_client = None
+        self._set_email_method(email_func)
+
+    def email(self, *args, **kwargs):
+        # Email through Taskcluster client
+        self.email_func(self._prepare_email(*args, **kwargs))
+
+    def _set_email_method(self, func):
+        self.email_func = func
+
+    def _prepare_email(self, *args, **kwargs):
+        return self.email_writer.prepare_email(*args, **kwargs)
+
+
+class TelemetryEmailWriter(EmailWriter):
+
+    def prepare_email(self, email, metric_info, alert, **kwargs):
+        self._write_address(email)
+        self._write_subject(metric_info)
+        self._write_content(metric_info, alert)
+
+        return self.email
+
+    def _write_address(self, email):
+        self._email.address = email
+
+    def _write_subject(self, metric_info):
+        self._email.subject = f"Telemetry Alert for Probe {metric_info['name']}"
+
+    def _write_content(self, metric_info, alert):
+        content = TelemetryEmailContent()
+        content.write_email(metric_info, alert)
+        self._email.content = str(content)
+
+
+class TelemetryEmailContent:
+    DESCRIPTION = (
+        "MozDetect has detected a telemetry change in a probe "
+        "you are subscribed to:"
+        "\n---\n"
+    )
+
+    TABLE_HEADERS = (
+        "| Channel | Probe | Platform | Date Range | Detection Push |\n"
+        "| :---: | :---: | :---: | :---: | :---: |\n"
+    )
+
+    ADDITIONAL_PROBES = (
+        "See below for additional probes that alerted at the same time (or near "
+        "the same push):"
+        "\n---\n"
+    )
+
+    def __init__(self):
+        self._raw_content = None
+
+    def write_email(self, metric_info, alert):
+        self._initialize_report_intro()
+        self._include_probe(
+            alert.get_detection_range(),
+            alert.telemetry_signature,
+            alert.telemetry_alert_summary
+        )
+
+        if alert.get_related_alerts():
+            self._include_additional_probes(alert)
+
+    def _initialize_report_intro(self):
+        if self._raw_content is None:
+            self._raw_content = self.DESCRIPTION + self.TABLE_HEADERS
+
+    def _include_probe(
+        self, detection_range, telemetry_signature, telemetry_alert_summary
+    ):
+        new_table_row = self._build_table_row(
+            detection_range, telemetry_signature, telemetry_alert_summary
+        )
+        self._raw_content += f"{new_table_row}\n"
+
+    def _include_additional_probes(self, alert):
+        self._raw_content += f"\n{self.ADDITIONAL_PROBES}{self.TABLE_HEADERS}"
+        for related_alert in alert.get_related_alerts():
+            self._include_probe(
+                alert.get_detection_range(),
+                related_alert.series_signature,
+                alert.telemetry_alert_summary
+            )
+
+    def _build_table_row(
+        self, detection_range, telemetry_signature, telemetry_alert_summary
+    ) -> str:
+        return (
+            "| {channel} | [{probe}]({glean_dictionary_link}) | {platform} "
+            "| [{date_from} - {date_to}]({treeherder_date_link})"
+            "| [Detection Push]({treeherder_push_link}) |"
+        ).format(
+            channel=telemetry_signature.channel,
+            probe=telemetry_signature.probe,
+            platform=telemetry_signature.platform,
+            date_from=detection_range["from"].time.strftime("%Y-%m-%d"),
+            date_to=detection_range["to"].time.strftime("%Y-%m-%d"),
+            treeherder_date_link=get_treeherder_detection_range_link(
+                detection_range, telemetry_signature
+            ),
+            treeherder_push_link=get_treeherder_detection_link(
+                detection_range, telemetry_signature
+            ),
+            glean_dictionary_link=get_glean_dictionary_link(
+                telemetry_signature
+            )
+        )
+
+    def __str__(self):
+        if self._raw_content is None:
+            raise ValueError("No content set")
+        return self._raw_content
